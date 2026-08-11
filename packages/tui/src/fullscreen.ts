@@ -90,6 +90,12 @@ export class FullscreenViewport {
 	private selectionAnchor: SelectionPoint | null = null;
 	private selectionHead: SelectionPoint | null = null;
 	private selectionMode: SelectionMode | null = null;
+	/** Columns reserved by the TUI's persistent left rail (0 when none). */
+	private railWidth = 0;
+
+	setRailWidth(width: number): void {
+		this.railWidth = Math.max(0, width);
+	}
 
 	/**
 	 * Compose a frame of exactly `height` lines: scrolled transcript window on
@@ -172,7 +178,7 @@ export class FullscreenViewport {
 			this.clearSelection();
 			return false;
 		}
-		const point = { line, col: Math.max(0, screenCol) };
+		const point = { line, col: Math.max(0, screenCol - this.railWidth) };
 		this.selectionAnchor = point;
 		this.selectionHead = { ...point };
 		const table = this.tableAtPoint(point);
@@ -191,7 +197,7 @@ export class FullscreenViewport {
 		if (!this.selectionAnchor || (this.selectionMode !== "transcript" && this.selectionMode !== "table")) return;
 		const line = this.transcriptLineForScreenRow(screenRow, true);
 		if (line === null) return;
-		this.selectionHead = { line, col: Math.max(0, screenCol) };
+		this.selectionHead = { line, col: Math.max(0, screenCol - this.railWidth) };
 	}
 
 	selectionAutoScrollDirection(screenRow: number): SelectionScrollDirection | null {

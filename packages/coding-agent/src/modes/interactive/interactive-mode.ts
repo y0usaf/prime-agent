@@ -34,6 +34,7 @@ import {
 	CombinedAutocompleteProvider,
 	type Component,
 	Container,
+	getKeybindings,
 	Loader,
 	type LoaderIndicatorOptions,
 	Markdown,
@@ -252,6 +253,8 @@ import {
 	theme,
 } from "./theme/theme.js";
 import { setWorkingPulseFrame, WORKING_ICON_INTERVAL_MS } from "./theme/working-icon.js";
+import { AgentsSidebar } from "./agents-sidebar.js";
+import type { SessionSummary } from "../daemon/daemon-session-list.js";
 
 /** Interface for components that can be expanded/collapsed */
 interface Expandable {
@@ -268,6 +271,8 @@ const HEARTBEAT_LEGACY_PROMPT_MIN_TOLERANCE_MS = 15_000;
 const HEARTBEAT_LEGACY_PROMPT_MAX_TOLERANCE_MS = 120_000;
 const MODEL_CATALOG_REFRESH_TTL_MS = 60_000;
 const FEATURE_HINT_DELAY_MS = 5_000;
+/** Width (columns) of the persistent agents/resume left rail. */
+const SIDEBAR_WIDTH = 30;
 
 export const START_HINTS = [
 	'Try "refactor @<filepath>"',
@@ -852,6 +857,10 @@ export class InteractiveMode {
 	private readonly retainedSubmissionGenerations = new WeakMap<PromptStash, number>();
 	private admitPendingStartupPrompts: (() => Promise<StartupPromptBarrierOutcome>) | undefined;
 	private agentsViewRequest: InteractiveModeRunResult["type"] | undefined;
+	/** Persistent agents/resume left rail (daemon-backed sessions only). */
+	private agentsSidebar: AgentsSidebar | undefined;
+	private agentsSidebarFocused = false;
+	private unsubscribeAgentsSidebarInput: (() => void) | undefined;
 	private loadingAnimation: Loader | undefined = undefined;
 	private workingMessage: string | undefined = undefined;
 	private workingVisible = true;
@@ -1407,6 +1416,8 @@ export class InteractiveMode {
 		}
 		this.ui.addChild(this.mainContainer);
 		this.ui.setFocus(this.editor);
+
+		this.setupAgentsSidebar();
 
 		this.setupKeyHandlers();
 		this.setupEditorSubmitHandler();
@@ -6707,9 +6718,127 @@ export class InteractiveMode {
 		stopThemeWatcher();
 	}
 
+	/**
+	 * Mount the persistent agents/resume sidebar as the TUI's left rail.
+	 * Only meaningful in daemon-backed mode (a daemon socket is required to
+	 * poll the roster). Keyboard focus in the editor is untouched; the rail is
+	 * navigable via focusAgentsSidebar().
+	 */
+	private setupAgentsSidebar(): void {
+		if (!this.options.daemonSocketPath) return;
+		if (this.agentsSidebar) return;
+		const sidebar = new AgentsSidebar({
+			daemonSocketPath: this.options.daemonSocketPath,
+			cwd: this.getCurrentCwd(),
+			sessionDir: this.connectionState?.sessionDir,
+			getCurrentSessionId: () => this.connectionState?.sessionId,
+			onOpenSession: (summary) => void this.openAgentsSidebarSession(summary),
+			onCurrentSession: () => {
+				this.showStatus("Already in this session");
+				this.unfocusAgentsSidebar();
+			},
+		});
+		this.agentsSidebar = sidebar;
+		this.ui.setLeftRail(sidebar, SIDEBAR_WIDTH);
+		// Route keys to the sidebar only while it is focused; everything else
+		// flows through to the editor untouched.
+		this.unsubscribeAgentsSidebarInput = this.ui.addInputListener((data: string) => {
+			if (!this.agentsSidebarFocused || !this.agentsSidebar) return undefined;
+			if (data === "x") {
+				this.agentsSidebarFocused = false;
+				this.ui.requestRender();
+				void this.killSelectedAgentsSidebar();
+				return { consume: true };
+			}
+			if (data === "r") {
+				void this.agentsSidebar?.refreshNow?.()?.then(() => this.ui.requestRender());
+				return { consume: true };
+			}
+			const consumed = this.agentsSidebar.handleInput(data);
+			if (consumed) {
+				this.ui.requestRender();
+				return { consume: true };
+			}
+			// Escape / left-arrow within the focused rail returns to the editor.
+			const kb = getKeybindings();
+			if (kb.matches(data, "tui.select.cancel") || kb.matches(data, "app.agents.back")) {
+				this.unfocusAgentsSidebar();
+				return { consume: true };
+			}
+			return undefined;
+		});
+		void sidebar.start();
+	}
+
+	/** Move keyboard focus into the sidebar (empty draft required). */
+	private focusAgentsSidebar(): boolean {
+		if (!this.agentsSidebar) return false;
+		if (this.editor.getText().trim()) {
+			this.showStatus("Send, stash, or clear your draft before browsing agents");
+			return true;
+		}
+		this.agentsSidebarFocused = true;
+		this.ui.requestRender();
+		return true;
+	}
+
+	private unfocusAgentsSidebar(): void {
+		if (!this.agentsSidebarFocused) return;
+		this.agentsSidebarFocused = false;
+		this.ui.requestRender();
+	}
+
+	/** Switch the current connection to the chosen session (in place). */
+	private async openAgentsSidebarSession(summary: SessionSummary): Promise<void> {
+		this.unfocusAgentsSidebar();
+		const sessionFile = summary.sessionFile;
+		if (!sessionFile) {
+			this.showStatus("Cannot resume a session without a saved session file", "warning");
+			return;
+		}
+		try {
+			await this.agentConnection.switchSession(sessionFile, {
+				cwdOverride: this.getCurrentCwd(),
+			});
+		} catch (error) {
+			this.showStatus(error instanceof Error ? error.message : String(error), "warning");
+		}
+	}
+
+	private async killSelectedAgentsSidebar(): Promise<void> {
+		if (!this.agentsSidebar) return;
+		const summary = this.agentsSidebar.getSelectedSummary();
+		if (!summary) return;
+		if (summary.sessionId === this.connectionState?.sessionId) {
+			this.showStatus("Cannot kill the current session");
+			return;
+		}
+		const ok = await this.agentsSidebar.killSelected();
+		this.showStatus(
+			ok ? "Agent stopped" : (this.agentsSidebar.getLastError?.() ?? "Kill failed"),
+			ok ? "dim" : "warning",
+		);
+		this.ui.requestRender();
+	}
+
+	private teardownAgentsSidebar(): void {
+		this.unsubscribeAgentsSidebarInput?.();
+		this.unsubscribeAgentsSidebarInput = undefined;
+		this.agentsSidebar?.dispose();
+		this.agentsSidebar = undefined;
+		this.agentsSidebarFocused = false;
+		this.ui.setLeftRail(null);
+	}
+
 	private handleAgentsBack(): boolean {
 		if (this.editor.getText().trim()) {
 			return false;
+		}
+		// With the persistent rail mounted, left arrow focuses it instead of
+		// tearing down to the full-screen agents view.
+		if (this.agentsSidebar) {
+			this.focusAgentsSidebar();
+			return true;
 		}
 		if (!this.options.returnToAgentsView) {
 			void this.requestAgentsView();
@@ -9674,6 +9803,7 @@ ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}${shor
 		this.stopGoalTrayTimer();
 		this.closeHeartbeatManager();
 		this.clearExtensionTerminalInputListeners();
+		this.teardownAgentsSidebar();
 		this.footer.dispose();
 		this.footerDataProvider.dispose();
 		if (this.unsubscribe) {

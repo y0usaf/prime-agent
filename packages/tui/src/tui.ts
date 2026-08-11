@@ -365,6 +365,26 @@ export class TUI extends Container {
 		focusOrder: number;
 	}[] = [];
 
+	// Persistent left rail (e.g. an agents sidebar). Base content renders in
+	// [railWidth, terminalWidth) and the rail component is composited over
+	// [0, railWidth). Undefined when no rail is active.
+	private leftRail: { component: Component; width: number } | undefined;
+
+	/**
+	 * Reserve a persistent left rail. The rail component is composited over the
+	 * left `width` columns of every rendered frame; all base content reflows
+	 * into the remaining columns. Pass null (or width 0) to clear it.
+	 */
+	setLeftRail(component: Component | null, width = 0): void {
+		this.leftRail = component && width > 0 ? { component, width } : undefined;
+		this.requestRender();
+	}
+
+	/** Width of the active left rail in columns, or 0 when none is set. */
+	getLeftRailWidth(): number {
+		return this.leftRail ? this.leftRail.width : 0;
+	}
+
 	constructor(terminal: Terminal, showHardwareCursor?: boolean) {
 		super();
 		this.terminal = terminal;
@@ -1388,6 +1408,35 @@ export class TUI extends Container {
 	}
 
 	/**
+	 * Paint the persistent left rail over the left `railWidth` columns of every
+	 * frame line. The rail is composited last so it sits above regular overlays;
+	 * image lines are left untouched (compositeLineAt skips them), which keeps
+	 * Kitty/iTerm placements intact in inline mode.
+	 */
+	private compositeLeftRail(
+		lines: string[],
+		railWidth: number,
+		termWidth: number,
+		termHeight: number,
+	): string[] {
+		const rail = this.leftRail;
+		if (!rail || railWidth <= 0) return lines;
+		const result = [...lines];
+		const railLines = rail.component.render(railWidth);
+		// Composite over the visible viewport (the bottom `termHeight` rows),
+		// matching how overlays anchor: on a long buffer the rail stays pinned
+		// to what is on screen instead of being drawn only at the buffer top.
+		const viewportStart = Math.max(0, result.length - termHeight);
+		for (let i = viewportStart; i < result.length; i++) {
+			result[i] = this.compositeLineAt(result[i], railLines[i - viewportStart] ?? "", 0, railWidth, termWidth);
+		}
+		// The rail never changes the frame's row count: excess rail rows are
+		// clipped here. Appending them would over-tall the frame and the
+		// fullscreen painter clips from the top, shifting the whole window up.
+		return result;
+	}
+
+	/**
 	 * Find and extract cursor position from rendered lines.
 	 * Searches for CURSOR_MARKER, calculates its position, and strips it from the output.
 	 * Only scans the bottom terminal height lines (visible viewport).
@@ -1423,12 +1472,18 @@ export class TUI extends Container {
 		this.syncFullscreenMouseTracking();
 		this.overlaySelectionRegions = [];
 
+		// A persistent left rail reserves `railWidth` columns: the scroll and
+		// dock render into the remaining width, then the composed frame is
+		// shifted right so the rail never overlaps content.
+		const railWidth = Math.min(this.getLeftRailWidth(), Math.max(0, width - 1));
+		const baseWidth = Math.max(1, width - railWidth);
+		fullscreen.viewport.setRailWidth(railWidth);
 		const transcript: string[] = [];
 		const selectionRegions: TableCellSelectionRegion[] = [];
 		const dock = withFullscreenImageFallback(() => {
 			for (const component of fullscreen.scroll) {
 				const lineOffset = transcript.length;
-				const componentLines = component.render(width);
+				const componentLines = component.render(baseWidth);
 				for (const region of component.getSelectionRegions?.() ?? []) {
 					selectionRegions.push({
 						...region,
@@ -1439,10 +1494,14 @@ export class TUI extends Container {
 				}
 				transcript.push(...componentLines);
 			}
-			return fullscreen.dock.render(width);
+			return fullscreen.dock.render(baseWidth);
 		});
 
 		let frame = fullscreen.viewport.composeFrame(transcript, dock, height, selectionRegions);
+		if (railWidth > 0) {
+			const pad = " ".repeat(railWidth);
+			frame = frame.map((line) => pad + line);
+		}
 		this.overlaySelectionRegions.push(
 			...this.createDockSelectionRegions(frame, fullscreen.viewport.windowHeight(), width),
 		);
@@ -1462,6 +1521,8 @@ export class TUI extends Container {
 		if (this.overlayStack.length > 0) {
 			frame = withFullscreenImageFallback(() => this.compositeOverlays(frame, width, height));
 		}
+		// The rail is composited last so it sits above overlays.
+		frame = this.compositeLeftRail(frame, railWidth, width, height);
 		const cursorPos = this.extractCursorPosition(frame, height);
 		fullscreen.viewport.applyFrameSelection(frame, height, this.overlaySelectionRegions);
 		this.applyLineResets(frame);
@@ -1498,13 +1559,27 @@ export class TUI extends Container {
 			return targetScreenRow - currentScreenRow;
 		};
 
-		// Render all components to get new lines
-		let newLines = this.render(width);
+		// Render all components to get new lines. A persistent left rail
+		// reserves `railWidth` columns: the base content renders into the
+		// remaining width and is shifted right so the rail never overlaps it.
+		const railWidth = Math.min(this.getLeftRailWidth(), Math.max(0, width - 1));
+		let newLines;
+		if (railWidth > 0) {
+			const pad = " ".repeat(railWidth);
+			newLines = this.render(width - railWidth).map((line) =>
+				isImageLine(line) ? line : pad + line,
+			);
+		} else {
+			newLines = this.render(width);
+		}
 
 		// Composite overlays into the rendered lines (before differential compare)
 		if (this.overlayStack.length > 0) {
 			newLines = this.compositeOverlays(newLines, width, height);
 		}
+
+		// The rail is composited last so it sits above overlays.
+		newLines = this.compositeLeftRail(newLines, railWidth, width, height);
 
 		// Extract cursor position before applying line resets (marker must be found first)
 		const cursorPos = this.extractCursorPosition(newLines, height);
