@@ -59,5 +59,8 @@
 			"rimraf": "6.1.2"
 		},
 		"shell-quote": "^1.10.0"
+	},
+	"peerDependencies": {
+		"@opentelemetry/api": "^1.9.0"
 	}
 }
